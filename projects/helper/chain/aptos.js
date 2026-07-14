@@ -4,7 +4,7 @@ const http = require('../http')
 const { getEnv } = require('../env')
 const coreTokensAll = require('../coreAssets.json')
 const { transformBalances } = require('../portedTokens')
-const { log, getUniqueAddresses } = require('../utils')
+const { log, getUniqueAddresses, sliceIntoChunks } = require('../utils')
 const { GraphQLClient } = require("graphql-request");
 
 
@@ -23,17 +23,29 @@ async function aQuery(api, chain = 'aptos') {
 
 async function getResources(account, chain = 'aptos') {
   const data = []
-  let lastData
   let cursor
+  let pageLen = 0
+
   do {
     let url = `${endpointMap[chain]()}/v1/accounts/${account}/resources?limit=9999`
     if (cursor) url += '&start=' + cursor
     const res = await http.getWithMetadata(url)
-    lastData = res.data
-    data.push(...lastData)
-    sdk.log('fetched resource length', lastData.length)
+
+    const page = Array.isArray(res?.data)
+      ? res.data
+      : Array.isArray(res?.data?.resources)
+        ? res.data.resources
+        : Array.isArray(res?.data?.data)
+          ? res.data.data
+          : Array.isArray(res?.data?.items)
+            ? res.data.items
+            : []
+
+    data.push(...page)
+    pageLen = page.length
+    sdk.log('fetched resource length', pageLen)
     cursor = res.headers['x-aptos-cursor']
-  } while (lastData.length === 9999)
+  } while (pageLen === 9999 && cursor)
   return data
 }
 
@@ -42,6 +54,21 @@ async function getResource(account, key, chain = 'aptos') {
   let url = `${endpointMap[chain]()}/v1/accounts/${account}/resource/${key}`
   const { data } = await http.get(url)
   return data
+}
+
+async function getFungibles(tokenAddress, owners, balances) {
+  if (!owners?.length) return;
+
+  await Promise.all(
+    owners.map(async (ownerRaw) => {
+      const owner = ownerRaw.toLowerCase();
+      const url = `${endpointMap['aptos']()}/v1/accounts/${owner}/balance/${tokenAddress}`;
+
+      const tokenAmount = await http.get(url);
+      if (!tokenAmount) return;
+      sdk.util.sumSingleBalance(balances, tokenAddress, tokenAmount)
+    })
+  );
 }
 
 function dexExport({
@@ -90,16 +117,48 @@ function dexExport({
   }
 }
 
+async function getBalance(account, token, chain = 'aptos') {
+  let url = `${endpointMap[chain]()}/v1/accounts/${account}/balance/${token}`
+  return await http.get(url)
+}
+
+const FA_BALANCES_QUERY = `query SumTokensFaBalances($addresses: [String!]!) {
+  current_fungible_asset_balances(where: { owner_address: { _in: $addresses } }) {
+    amount
+    asset_type
+  }
+}`
+
 async function sumTokens({ balances = {}, owners = [], blacklistedTokens = [], tokens = [], api, chain = 'aptos' }) {
   if (api) chain = api.chain
-  owners = getUniqueAddresses(owners, true)
-  const resources = await Promise.all(owners.map(i => getResources(i, chain)))
-  resources.flat().filter(i => i.type.includes('::CoinStore')).forEach(i => {
-    const token = i.type.split('<')[1].replace('>', '')
-    if (tokens.length && !tokens.includes(token)) return;
-    if (blacklistedTokens.includes(token)) return;
-    sdk.util.sumSingleBalance(balances, token, i.data.coin.value)
-  })
+  const uniqueOwners = getUniqueAddresses(owners, true)
+  const validTokens = tokens.filter(token => !blacklistedTokens.includes(token));
+
+  // On aptos the indexer's `current_fungible_asset_balances` view returns balances for many owners in
+  // a single query (asset_type is the coin type for coin-standard assets, matching the REST /balance result),
+  // so we avoid the O(owners * tokens) per-call REST loop. Other chains (e.g. movement) have no such indexer.
+  if (chain === 'aptos') {
+    const tokenSet = new Set(validTokens)
+    for (const ownerChunk of sliceIntoChunks(uniqueOwners, 50)) {
+      const { current_fungible_asset_balances: rows } = await graphQLClient.request(FA_BALANCES_QUERY, { addresses: ownerChunk })
+      rows.forEach(({ amount, asset_type }) => {
+        if (!tokenSet.has(asset_type)) return;
+        sdk.util.sumSingleBalance(balances, asset_type, amount);
+      })
+    }
+    return transformBalances(chain, balances)
+  }
+
+  for (const owner of uniqueOwners) {
+    const balancesPerToken = await Promise.all(
+        validTokens.map(token => getBalance(owner, token))
+    );
+
+    validTokens.forEach((token, index) => {
+      sdk.util.sumSingleBalance(balances, token, balancesPerToken[index]);
+    });
+  }
+
   return transformBalances(chain, balances)
 }
 

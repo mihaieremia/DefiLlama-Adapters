@@ -1,15 +1,16 @@
 const { getConfig } = require('../helper/cache')
-const { sumTokens } = require('../helper/sumTokens');
+const { sumTokens, sumTokensExport } = require('../helper/sumTokens');
 const { sumTokens2 } = require('../helper/unwrapLPs');
 
 const chainMapping = {
   avax: 'avalanche',
   cosmos: 'cosmoshub',
+  xrplevm: 'xrpl-evm',
   terra2: 'terra-2',
   bsc: 'binance'
 };
 
-const blackListChains = ['comdex', 'crescent'];
+const blackListChains = ['comdex', 'crescent', 'evmos', 'kujira', 'migaloo' ];
 const chainListSupply = [
   'agoric', 
   'archway', 
@@ -46,6 +47,7 @@ const chainListTotal = [
   'bsc', 
   'celo', 
   'ethereum', 
+  'xrplevm', 
   'fantom', 
   'filecoin',
   'imx',
@@ -96,3 +98,7 @@ chainListSupply.concat(chainListTotal).forEach(chain => {
 });
 
 module.exports.timetravel = false;
+
+module.exports.ripple = {
+  tvl: sumTokensExport({ owner: 'rfmS3zqrQrka8wVyhXifEeyTwe8AMz2Yhw'})
+}
